@@ -24,7 +24,7 @@ parser.add_argument('-t', '--model-type', help='are we training a encoder-decode
                     required=False, default='encoder-decoder', choices=['encoder-decoder', 'decoder'])
 parser.add_argument('-c', '--use_comet', help='use coment_ml to track experiments or not', required=False, default=False, action='store_true')
 parser.add_argument('-r', '--ratio', help='the ratio of indexing to retrieval examples', default=1)
-parser.add_argument('--doc-ids', help='the method of creating doc ids', default='atomic', choices=['naive', 'semantic', 'atomic'])
+parser.add_argument('--doc-ids', help='the method of creating doc ids', default='atomic', choices=['naive', 'semantic', 'atomic', 'wikipedia-prefix'])
 parser.add_argument('-e', '--experiment-dir', help='the output directory of the model training, i.e., where to load the model from', default='experiment')
 parser.add_argument('--test-batch-size', help='batch size used for evaluation', default=2)
 parser.add_argument('--seed', help='seed for the dataset', default=0)
@@ -34,11 +34,10 @@ trec_eval = load("trec_eval")
 
 def get_predictions_encoder_decoder(args, test_ds, model, tokenizer):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    test_data_loader = DataLoader(test_ds, batch_size=args.test_batch_size)
+    test_data_loader = DataLoader(test_ds, batch_size=int(args.test_batch_size))
     id_to_results = {}
 
     if args.doc_ids == 'atomic':
-
         for batch in test_data_loader:
             input_ids = batch['input_ids'].to(device)
             decoder_input_ids = torch.zeros(input_ids.shape[0],1).long().to(device)
@@ -58,8 +57,18 @@ def get_predictions_encoder_decoder(args, test_ds, model, tokenizer):
             input_text = tokenizer.batch_decode(input_ids)
             output = eval_pipeline(input_text, num_beams=10, num_return_sequences=10)
             for j, q_id in enumerate(examples['query_id']):
+                if args.doc_ids == 'semantic':
+                    # Keep underscores for semantic IDs
+                    results = [r['translation_text'].replace(' ', '_') for r in output[j]]
+                elif args.doc_ids == 'wikipedia-prefix':
+                    # Keep spaces for wikipedia-prefix IDs
+                    results = [r['translation_text'] for r in output[j]]
+                else:
+                    # Default behavior for other types
+                    results = [r['translation_text'].replace(' ', '_') for r in output[j]]
+                
                 id_to_results[q_id] = {
-                    'results': [r['translation_text'].replace(' ', '_') for r in output[j]],
+                    'results': results,
                     'scores': [len(output[j]) - rank for rank, _ in enumerate(output[j])],
                     'input_ids': input_ids[j]
                 }
@@ -67,7 +76,7 @@ def get_predictions_encoder_decoder(args, test_ds, model, tokenizer):
 
 def get_predictions_decoder(args, test_ds, model, tokenizer):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    test_data_loader = DataLoader(test_ds, batch_size=args.per_device_eval_batch_size)
+    test_data_loader = DataLoader(test_ds, batch_size=args.test_batch_size)  # Fixed: was args.per_device_eval_batch_size
     id_to_results = {}
 
     if args.doc_ids == 'atomic':
@@ -94,8 +103,29 @@ def get_predictions_decoder(args, test_ds, model, tokenizer):
             input_text = tokenizer.batch_decode(input_ids)
             output = eval_pipeline(input_text, num_beams=10, num_return_sequences=10)
             for j, q_id in enumerate(examples['query_id']):
+                if args.doc_ids == 'semantic':
+                    # Keep underscores for semantic IDs
+                    results = [r['generated_text'].replace(' ', '_') for r in output[j]]
+                elif args.doc_ids == 'wikipedia-prefix':
+                    # Keep spaces for wikipedia-prefix IDs  
+                    # results = [r['generated_text'] for r in output[j]]
+                    results = []
+                    for r in output[j]:
+                        doc_id = r['translation_text']
+                        words = doc_id.split()
+                        try:
+                            wikipedia_index = words.index('wikipedia')
+                            doc_id = ' '.join(words[:wikipedia_index + 1])
+                        except ValueError:
+                            # If 'wikipedia' is not found, keep the original doc_id
+                            pass
+                        results.append(doc_id)
+                else:
+                    # Default behavior for other types
+                    results = [r['generated_text'].replace(' ', '_') for r in output[j]]
+                
                 id_to_results[q_id] = {
-                    'results': [r['generated_text'].replace(' ', '_') for r in output[j]],
+                    'results': results,
                     'scores': [len(output[j]) - rank for rank, _ in enumerate(output[j])],
                     'input_ids': input_ids[j]
                 }
@@ -141,6 +171,16 @@ def evaluate(args, test_ds, qrels, model, tokenizer, experiment_dir, accelerator
                 doc_id = tokenizer.decode(doc_id_token)
             else:
                 doc_id = doc_id_token
+                # Truncate at "wikipedia" for wikipedia-prefix doc-ids
+                # if args.doc_ids == 'wikipedia-prefix':
+                #     words = doc_id.split()
+                #     try:
+                #         wikipedia_index = words.index('wikipedia')
+                #         doc_id = ' '.join(words[:wikipedia_index + 1])
+                #     except ValueError:
+                #         # If 'wikipedia' is not found, keep the original doc_id
+                #         pass
+
             run["query"].append(i)
             q_id_to_int[q_id] = i
             run["docid"].append(doc_id)
@@ -166,16 +206,34 @@ def evaluate(args, test_ds, qrels, model, tokenizer, experiment_dir, accelerator
 
     r_5 = sum([r_5_per_q[key] for key in r_5_per_q]) / len(id_to_results)
 
-    max_id = i + 1
-    new_qrel_queries = []
-    for q_id in qrels['query']:
-        if q_id in q_id_to_int:
-            new_qrel_queries.append(q_id_to_int[q_id])
-        else:
-            new_qrel_queries.append(max_id)
-            max_id += 1
-    qrels['query'] = new_qrel_queries
-    results = trec_eval.compute(references=[qrels], predictions=[run])
+    # max_id = i + 1
+    # new_qrel_queries = []
+    # for q_id in qrels['query']:
+    #     if q_id in q_id_to_int:
+    #         new_qrel_queries.append(q_id_to_int[q_id])
+    #     else:
+    #         new_qrel_queries.append(max_id)
+    #         max_id += 1
+    # qrels['query'] = new_qrel_queries
+    # results = trec_eval.compute(references=[qrels], predictions=[run])
+    # FIXED CODE - Complete qrels conversion:
+    qrels_converted = {
+        "query": [],
+        "q0": [],
+        "docid": [],
+        "rel": []
+    }
+    
+    # Convert ALL fields to match TREC format
+    for i, q_id in enumerate(qrels['query']):
+        if q_id in q_id_to_int:  # Only process queries we have predictions for
+            qrels_converted["query"].append(q_id_to_int[q_id])  # Convert to integer
+            qrels_converted["q0"].append(qrels['q0'][i])         # Copy Q0 field
+            qrels_converted["docid"].append(qrels['docid'][i])   # Copy document ID
+            qrels_converted["rel"].append(int(qrels['rel'][i]))  # Convert to integer
+    
+    # Use the properly converted qrels
+    results = trec_eval.compute(references=[qrels_converted], predictions=[run])
     results['hits@1'] = hits_1
     results['hits@10'] = hits_10
     results['recall@5'] = r_5

@@ -10,6 +10,8 @@ import string
 from utils.utils import *
 
 import json
+import re
+import random
 
 parser = ArgumentParser(prog='Team Preprocessing', description='Preprocessing for GenIR')
 parser.add_argument('-i', '--input', help='input path of the data', required=False)
@@ -21,27 +23,77 @@ parser.add_argument('-o', '--output', help='output path of the processed data', 
 parser.add_argument('-m', '--model-path', help='model identifier from the huggingface hub or path', required=True)
 parser.add_argument('--tokenizer', help='if you want to use another tokenizer than the model_path tokenizer, please specify it here', required=False, default=None)
 parser.add_argument('-r', '--ratio', help='the ratio of indexing to retrieval examples, int for ratio, None for no increased/decreased ratio', default=1)
+# TODO maybe we can increase the max length
 parser.add_argument('--max-length', help='maximum length of the input to the model (document + doc_id)', default=128, type=int)
-parser.add_argument('--doc-ids', help='the method of creating doc ids', default='atomic', choices=['naive', 'semantic', 'atomic'])
+parser.add_argument('--doc-ids', help='the method of creating doc ids', default='atomic', choices=['naive', 'semantic', 'atomic', 'wikipedia-prefix'])
 parser.add_argument('--prefix', help='prefix prepended to the input string (e.g., a prompt)', default='')
 parser.add_argument('--token', help='access token for gated HF models and tokenizers', default=None)
 parser.add_argument('--semantic-doc-id-mapping', help='mapping from doc ids to semantic doc ids', default=None)
+parser.add_argument('--inverted-index', 
+                   help='enable inverted index processing', 
+                   action='store_true', 
+                   default=False)
+#TODO think of adding a flag for summerization
 
 text_max_length = 1000
 def convert_doc_id_semantic(mapping, doc_id):
     return mapping[str(doc_id)]
 
-def create_retrieval_data(queries, doc_id_fct=convert_doc_id_token):
+def convert_doc_id_wikipedia_prefix(doc_text, suffix="wikipedia"):
+    """Extract words before 'wikipedia' from document text as doc ID and append suffix"""
+    text = doc_text.lower()
+    if 'wikipedia' in text:
+        # Find the position of 'wikipedia'
+        wiki_pos = text.find('wikipedia')
+        # Get text before 'wikipedia'
+        prefix_text = text[:wiki_pos].strip()
+        # Extract words as identifier
+        words = prefix_text.split()
+        doc_id_words = words
+        # Clean words and join with spaces
+        clean_words = []
+        for word in doc_id_words:
+            # Remove punctuation and keep only alphanumeric
+            clean_word = ''.join(c for c in word if c.isalnum())
+            if clean_word:
+                clean_words.append(clean_word)
+        
+        # Add suffix at the end
+        if clean_words:
+            return ' '.join(clean_words) + f' {suffix}'
+        else:
+            return f'unknown {suffix}'
+    else:
+        # Fallback: use first few words of document + suffix
+        words = doc_text.split()[:2]
+        clean_words = [''.join(c for c in word if c.isalnum()) for word in words]
+        if clean_words:
+            return ' '.join(clean_words) + f' {suffix}'
+        else:
+            return f'unknown {suffix}'
+
+def create_doc_id_mapping(documents, doc_id_fct):
+    """Create mapping from document ID to converted doc ID"""
+    mapping = {}
+    for doc in documents:
+        if doc_id_fct == convert_doc_id_wikipedia_prefix:
+            mapping[doc['id']] = doc_id_fct(doc['text'])
+        else:
+            mapping[doc['id']] = doc_id_fct(doc['id'])
+    return mapping
+
+def create_retrieval_data(queries, doc_id_mapping):
     retrieval_data = []
     doc_ids = [] 
     for query in queries:
         for rank, doc_id in enumerate(query['relevant_docs']):
-            doc_ids.append(doc_id_fct(doc_id))
-            retrieval_data.append({'text': query['query'], 'doc_id': doc_id_fct(doc_id), 'rank': rank})
+            converted_doc_id = doc_id_mapping.get(doc_id, f"unknown_{doc_id}")
+            doc_ids.append(converted_doc_id)
+            retrieval_data.append({'text': query['query'], 'doc_id': converted_doc_id, 'rank': rank})
             
     return retrieval_data, doc_ids
 
-def create_test_data(queries, doc_id_fct=convert_doc_id_token):
+def create_test_data(queries, doc_id_mapping):
     test_data = []
     qrels = {
         "query": [],
@@ -52,9 +104,10 @@ def create_test_data(queries, doc_id_fct=convert_doc_id_token):
     doc_ids = []
     for query in queries:
         for rank, doc_id in enumerate(query['relevant_docs']):
-            doc_ids.append(doc_id_fct(doc_id))
+            converted_doc_id = doc_id_mapping.get(doc_id, f"unknown_{doc_id}")
+            doc_ids.append(converted_doc_id)
             qrels["query"].append(query['id'])
-            qrels["docid"].append(doc_id_fct(doc_id))
+            qrels["docid"].append(converted_doc_id)
             qrels["q0"].append('q0')
             qrels["rel"].append(4 - rank) # our first document is more relevant than the documents are the second rank, most relevant = 4, second document = 3
             # might need to revised for other datasets. Maybe that should be hardcoded into the dataset as it usually comes from the annotators.
@@ -63,13 +116,42 @@ def create_test_data(queries, doc_id_fct=convert_doc_id_token):
 
     return test_data, qrels, doc_ids
     
-def create_index_data(documents, doc_id_fct=convert_doc_id_token):
+def create_index_data(documents, doc_id_fct=convert_doc_id_token, inverted_index=False):
     index_data = []
     all_doc_ids = []
 
     for doc in documents:
-        converted_doc_ids = doc_id_fct(doc['id'])
-        index_data.append({'text':doc['text'][:text_max_length], 'doc_id': converted_doc_ids})
+        if doc_id_fct == convert_doc_id_wikipedia_prefix:
+            converted_doc_ids = doc_id_fct(doc['text'][:text_max_length])
+            # Extract the doc_id length to remove it from the beginning of the text
+            doc_id_text = converted_doc_ids
+            doc_text = doc['text']
+            doc_text = re.sub(re.escape(doc_id_text), '', doc_text, flags=re.IGNORECASE).strip()
+            # Find the first occurrence of 'wikipedia' (case-insensitive) and start doc_text from there
+            wiki_pos = doc_text.lower().find('wikipedia')
+            if wiki_pos != -1:
+                doc_text = doc_text[wiki_pos+9:]
+            if inverted_index:
+                # Replace all occurrences of doc_id_text with 'title' (case-insensitive)
+                remaining_text = re.sub(re.escape(doc_id_text), 'title', doc_text, flags=re.IGNORECASE)
+                
+                # Take max_length contiguous words starting randomly from the document text
+                words = remaining_text.split()
+                if len(words) <= text_max_length:
+                    # If document is shorter than or equal to max length, use all words
+                    selected_text = remaining_text
+                else:
+                    # Randomly select starting position
+                    max_start_pos = len(words) - text_max_length
+                    start_pos = random.randint(0, max_start_pos)
+                    selected_words = words[start_pos:start_pos + text_max_length]
+                    selected_text = ' '.join(selected_words)
+                
+                doc_text = selected_text
+            index_data.append({'text': doc_text, 'doc_id': converted_doc_ids})
+        else:
+            converted_doc_ids = doc_id_fct(doc['id'])
+            index_data.append({'text':doc['text'][:text_max_length], 'doc_id': converted_doc_ids})
         all_doc_ids.append(converted_doc_ids)
 
     return index_data, all_doc_ids
@@ -223,6 +305,9 @@ def tokenize_data(ds, tokenizer, args, model_type):
                     model_inputs = tokenizer(inputs, max_length=args.max_length, truncation=True)
                     targets = tokenizer([], text_target=targets, is_split_into_words=True, max_length=args.max_length, truncation=True)
                     model_inputs['labels'] = targets['labels']
+                elif args.doc_ids == 'wikipedia-prefix':
+                    # Handle wikipedia-prefix like naive (multi-word targets as text)
+                    model_inputs = tokenizer(inputs, text_target=targets, max_length=args.max_length, truncation=True)
 
             else:
                 model_inputs = tokenizer(inputs, max_length=args.max_length, truncation=True, padding="max_length")
@@ -265,6 +350,70 @@ def store_data(out_path, ds, val_qrels, test_qrels=None):
         json.dump(test_qrels, open(f'{out_path}/test_qrels.json', 'w'))
 
 
+def collect_doc_id_stats(all_doc_ids, doc_id_type):
+    """Collect and print statistics about document ID lengths"""
+    if doc_id_type != 'wikipedia-prefix':
+        return
+    
+    print(f"\n=== Document ID Statistics for {doc_id_type} ===")
+    
+    # Calculate word counts and character counts
+    word_counts = []
+    char_counts = []
+    
+    for doc_id in all_doc_ids:
+        if isinstance(doc_id, str):
+            words = doc_id.split()
+            word_counts.append(len(words))
+            char_counts.append(len(doc_id))
+    
+    if word_counts:
+        import numpy as np
+        
+        print(f"Total unique document IDs: {len(all_doc_ids)}")
+        print(f"\nWord Count Statistics:")
+        print(f"  Min words: {min(word_counts)}")
+        print(f"  Max words: {max(word_counts)}")
+        print(f"  Mean words: {np.mean(word_counts):.2f}")
+        print(f"  Median words: {np.median(word_counts):.2f}")
+        print(f"  Std words: {np.std(word_counts):.2f}")
+        
+        print(f"\nCharacter Count Statistics:")
+        print(f"  Min characters: {min(char_counts)}")
+        print(f"  Max characters: {max(char_counts)}")
+        print(f"  Mean characters: {np.mean(char_counts):.2f}")
+        print(f"  Median characters: {np.median(char_counts):.2f}")
+        print(f"  Std characters: {np.std(char_counts):.2f}")
+        
+        # Distribution of word counts
+        from collections import Counter
+
+        
+        word_dist = Counter(word_counts)
+        print(f"\nWord Count Distribution:")
+        for count in sorted(word_dist.keys()):
+            print(f"  {count} words: {word_dist[count]} documents ({word_dist[count]/len(word_counts)*100:.1f}%)")
+        
+        # Show some examples
+        print(f"\nExample Document IDs:")
+        # Sort by length for better examples
+        sorted_ids = sorted(all_doc_ids, key=lambda x: len(x.split()) if isinstance(x, str) else 0)
+        
+        # Show shortest
+        print(f"  Shortest: '{sorted_ids[0]}' ({len(sorted_ids[0].split())} words)")
+        
+        # Show longest
+        print(f"  Longest: '{sorted_ids[-1]}' ({len(sorted_ids[-1].split())} words)")
+        
+        # Show some random middle examples
+        mid_start = len(sorted_ids) // 3
+        mid_end = 2 * len(sorted_ids) // 3
+        for i in range(mid_start, min(mid_start + 3, mid_end)):
+            doc_id = sorted_ids[i]
+            print(f"  Example: '{doc_id}' ({len(doc_id.split())} words)")
+    
+    print("=" * 50)
+
 def main():
     print('start script')
     args = parser.parse_args()
@@ -292,22 +441,31 @@ def main():
         doc_id_fct = partial(convert_doc_id_semantic, semantic_doc_id_mapping)
     elif args.doc_ids == 'naive':
         doc_id_fct = lambda x: str(x)
+    elif args.doc_ids == 'wikipedia-prefix':
+        doc_id_fct = convert_doc_id_wikipedia_prefix
     else:
-        raise NotImplementedError(f'Currently, only atomic, naive and semantic doc_ids are implemented. But you requested: {args.doc_ids}')
-    index_data, all_doc_ids = create_index_data(documents, doc_id_fct)
+        raise NotImplementedError(f'Currently, only atomic, naive, semantic and wikipedia-prefix doc_ids are implemented. But you requested: {args.doc_ids}')
+    
+    # Create document ID mapping first
+    doc_id_mapping = create_doc_id_mapping(documents, doc_id_fct)
+    
+    index_data, all_doc_ids = create_index_data(documents, doc_id_fct, inverted_index=args.inverted_index)
 
-    retrieval_data, ret_doc_ids  = create_retrieval_data(train_queries, doc_id_fct)
-    val_retrieval_data, val_ret_doc_ids  = create_retrieval_data(val_queries, doc_id_fct)
-    complete_val_retrieval_data, val_qrels, _ = create_test_data(val_queries, doc_id_fct)
+    retrieval_data, ret_doc_ids = create_retrieval_data(train_queries, doc_id_mapping)
+    val_retrieval_data, val_ret_doc_ids = create_retrieval_data(val_queries, doc_id_mapping)
+    complete_val_retrieval_data, val_qrels, _ = create_test_data(val_queries, doc_id_mapping)
     print(len(all_doc_ids))
     all_doc_ids = all_doc_ids + ret_doc_ids + val_ret_doc_ids
     all_doc_ids = list(set(all_doc_ids))
     print(len(all_doc_ids))
     if test_queries:
-        test_retrieval_data, test_qrels, test_doc_ids = create_test_data(test_queries, doc_id_fct)
+        test_retrieval_data, test_qrels, test_doc_ids = create_test_data(test_queries, doc_id_mapping)
         all_doc_ids = list(set(all_doc_ids + test_doc_ids))
     print(len(all_doc_ids))
-
+    
+    # Add statistics collection here
+    collect_doc_id_stats(all_doc_ids, args.doc_ids)
+    
     if args.tokenizer:
         tok_path = args.tokenizer
     else:

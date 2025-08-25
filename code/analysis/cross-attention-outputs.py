@@ -87,27 +87,47 @@ if __name__ == "__main__":
     per_q_averages_sIII = defaultdict(list)
     for i, (q_id, query, doc) in tqdm(enumerate(correct_queries_with_d_id), total=len(correct_queries_with_d_id)):
         input = get_tokens(query)
-        _, activation_cache = model.run_with_cache(input, decoder_input=decoder_input)
-        for layer in range(7,24):
 
-            neuron_activations = activation_cache[f'decoder.{layer}.hook_cross_attn_out']
-            value_logits = logit_lens_decoder(neuron_activations, model=model).cpu()
-            topk_res = torch.topk(value_logits, k=1000)
+        generated_tokens = []
+        for step in range(10):
+            _, activation_cache = model.run_with_cache(input, decoder_input=decoder_input)
+            for layer in range(7,model.cfg.n_layers):
 
-            num_doc_ids = defaultdict(int)
-            for i in range(1000):
-                if topk_res.indices[0][0][i] >= first_added_doc_id:
-                    if i < 10:
-                        num_doc_ids["10"] += 1
-                    if i < 100:
-                        num_doc_ids["100"] += 1
-                    
-                    num_doc_ids["1000"] += 1
-            for key in ["10", "100", "1000"]:
-                if layer < 17:
-                    per_q_averages_sII[key].append(num_doc_ids[key] / int(key))
-                else:
-                    per_q_averages_sIII[key].append(num_doc_ids[key] / int(key))
+                neuron_activations = activation_cache[f'decoder.{layer}.hook_cross_attn_out']
+                current_pos_activations = neuron_activations[0, -1:, :]
+
+                value_logits = logit_lens_decoder(neuron_activations, model=model).cpu()
+                topk_res = torch.topk(value_logits, k=1000)
+
+                num_doc_ids = defaultdict(int)
+                for i in range(1000):
+                    if topk_res.indices[0][0][i] >= first_added_doc_id:
+                        if i < 10:
+                            num_doc_ids["10"] += 1
+                        if i < 100:
+                            num_doc_ids["100"] += 1
+                        
+                        num_doc_ids["1000"] += 1
+                for key in ["10", "100", "1000"]:
+                    if layer < 17:
+                        per_q_averages_sII[key].append(num_doc_ids[key] / int(key))
+                    else:
+                        per_q_averages_sIII[key].append(num_doc_ids[key] / int(key))
+
+            logits = model(input, decoder_input)[0, -1, :]
+            next_token = logits.argmax().item()
+            
+            if next_token == tokenizer.eos_token_id:
+                break
+                
+            original_token = tokenizer.encode(doc.split()[step])[0]
+            assert next_token == original_token, f"Expected {original_token} but got {next_token} for query {query} and doc {doc} at step {step}"
+            
+            generated_tokens.append(next_token)
+            decoder_input = torch.cat([
+                decoder_input,
+                torch.tensor([[next_token]])
+            ], dim=1)
 
     json.dump(per_q_averages_sII, open(f'{out_dir}/per_q_averages_sII.json', 'w'))
     json.dump(per_q_averages_sIII, open(f'{out_dir}/per_q_averages_sIII.json', 'w'))

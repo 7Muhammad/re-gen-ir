@@ -58,9 +58,11 @@ def train(args, ds, model, tokenizer, training_args, data_collator):
             
         preds, labels = eval_preds
         # shape N x label_length x |V|
+        # (batch_size, sequence_length, vocabulary_size)
         if isinstance(preds, tuple):
             preds = preds[0]
 
+        # TODO run to see how this works exactly
         if args.doc_ids == 'atomic':
             hits_at_1 = 0
             hits_at_10 = 0
@@ -99,12 +101,33 @@ def train(args, ds, model, tokenizer, training_args, data_collator):
             hits_at_1 = 0
             result = {}
             if args.model_type == 'encoder-decoder':
-                decoded_preds = postprocess(tokenizer.batch_decode(preds, skip_special_tokens=True))
+                pred_ids = np.argmax(preds, axis=-1)  # Logits → Token IDs
+                decoded_preds = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)  # Token IDs → Text
+                # decoded_preds = postprocess(tokenizer.batch_decode(preds, skip_special_tokens=True))
                 labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
                 decoded_labels = postprocess(tokenizer.batch_decode(labels, skip_special_tokens=True))
                 level_results = defaultdict(int)
 
                 for pred, label in zip(decoded_preds, decoded_labels):
+                    # if args.doc_ids == 'wikipedia-prefix':
+                    #     if pred.startswith(label[0]):
+                    #     # if pred == label[0]:
+                    #         hits_at_1 += 1
+                    #     continue
+                    if args.doc_ids == 'wikipedia-prefix':
+                        # Apply same truncation logic as in eval.py
+                        words = pred.split()
+                        try:
+                            wikipedia_index = words.index('wikipedia')
+                            truncated_pred = ' '.join(words[:wikipedia_index + 1])
+                        except ValueError:
+                            # If 'wikipedia' is not found, keep the original pred
+                            truncated_pred = pred
+                        
+                        # Now do exact match like in eval.py
+                        if truncated_pred == label[0]:
+                            hits_at_1 += 1
+                        continue
                     if pred == label:
                         hits_at_1 += 1
                     if args.doc_ids == 'semantic':
@@ -116,9 +139,9 @@ def train(args, ds, model, tokenizer, training_args, data_collator):
                                 level_results[i] += 1
                             else:
                                 break
-
+                # TODO add levels accuracy for wikipedia-prefix
                 result['hits@1'] = hits_at_1 / labels.shape[0]
-                if args.doc_ids == 'semantic':
+                if args.doc_ids in ['semantic']:
                     for k, v in level_results.items():
                         result[f'level_{k}_hits'] = v / labels.shape[0]
                 
@@ -129,7 +152,7 @@ def train(args, ds, model, tokenizer, training_args, data_collator):
                             experiment.log_text(text=text,  metadata=metadata)
 
             else:
-                raise NotImplementedError('Only encoder-decoder models are supported for semantic and naive doc ids.')
+                raise NotImplementedError('Only encoder-decoder models are supported for semantic, naive and wikipedia-prefix doc ids.')
 
 
         result = {k: round(v, 4) for k, v in result.items()}

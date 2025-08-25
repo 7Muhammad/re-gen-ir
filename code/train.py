@@ -19,8 +19,8 @@ def add_arguments(parser):
     parser.add_argument('-m', '--model-name', help='model identifier that was used during pre-processing', required=True)
     parser.add_argument('-c', '--use-comet', help='use coment_ml to track experiments or not', required=False, default=False, action='store_true')
     parser.add_argument('-r', '--ratio', help='the ratio of indexing to retrieval examples', default=1)
-    parser.add_argument('--doc-ids', help='the method of creating doc ids', default='atomic', choices=['naive', 'semantic', 'atomic'])
-    parser.add_argument('-o', '--output-dir', help='the output directory of the model', default='experiment')
+    parser.add_argument('--doc-ids', help='the method of creating doc ids', default='atomic', choices=['naive', 'semantic', 'atomic', 'wikipedia-prefix'])
+    parser.add_argument('-o', help='the output directory of the model', default='experiment')
     parser.add_argument('--test-batch-size', help='batch size used for evaluation', default=2)
     parser.add_argument('-s', "--everything-seed", help='sets the seed to a predetermined value', type=int)
     parser.add_argument('--remove', help='a list of docs to remove from the training, syntax: str "D1, D2, ..."', type=str, default='')
@@ -84,7 +84,7 @@ def main():
         data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
     elif args.model_type == "decoder":
         model = AutoModelForSequenceClassification.from_pretrained(model_dir)
-        del model.config.label2id
+        del model. fig.label2id
         del model.config.id2label
 
         def data_collator(features):
@@ -111,6 +111,12 @@ def main():
 #        training_args = Seq2SeqTrainingArguments(model_dir)
 #        training_args.resume_from_checkpoint = resume
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name_clean = args.model_name.replace('/', '_').replace('\\', '_')
+    output_dir = f"{model_name_clean}_{timestamp}"
+    training_args.output_dir = output_dir
+    print(f"Auto-generated output directory: {output_dir}")
+
     train(args, ds, model, tokenizer, training_args, data_collator)
 
     if not args.load_best_model_at_end:
@@ -120,12 +126,12 @@ def main():
 
     print('Evaluation on Validation Set:')
     qrels = json.load(open(f"{data_dir}/valid_qrels.json"))
-    evaluate(args, ds['complete_valid'], qrels, model, tokenizer, args.output_dir, data_prefix='valid')
+    evaluate(args, ds['complete_valid'], qrels, model, tokenizer, args.o, data_prefix='valid')
 
     if 'test' in ds:
         print('Evaluation on Test Set:')
         qrels = json.load(open(f"{data_dir}/test_qrels.json"))
-        evaluate(args, ds['test'], qrels, model, tokenizer, args.output_dir, data_prefix='test')
+        evaluate(args, ds['test'], qrels, model, tokenizer, args.o, data_prefix='test')
     else:
         print('No Test Set found.')
 
