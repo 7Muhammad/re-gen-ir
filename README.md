@@ -1,4 +1,4 @@
-# Reverse-Engineering the Retrieval Process in GenIR Models (Fork)
+# Reverse-Engineering the Retrieval Process in GenIR Models
 
 This repository is a fork of the original project "Reverse-Engineering the Retrieval Process in GenIR Models" with our own modifications and contributions.
 
